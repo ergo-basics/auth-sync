@@ -2,10 +2,10 @@
 // High-level API. A `Signer` abstracts how a tx gets signed (browser wallet,
 // seed phrase on a server, or "just give me the unsigned tx").
 
-import { buildSyncTx, fetchLatestBox } from './chain';
-import { decodeRegisters, encodeRegisters } from './codec';
+import { buildSyncTx, fetchBoxes, mergeBoxes, type Merged } from './chain';
+import { decodeRegisters, encodeRegisters, splitEntries } from './codec';
 import { DEFAULT_EXPLORER } from './constants';
-import type { InputBox, SyncBundle, SyncRecord } from './types';
+import type { Entries, InputBox } from './types';
 
 export interface Signer {
 	address(): Promise<string>;
@@ -16,15 +16,21 @@ export interface Signer {
 }
 
 export interface PushParams {
-	publicRecords?: SyncRecord[];
-	secretRecords?: SyncRecord[];
+	/** Entries to write unencrypted. A `null` value deletes the key. */
+	publicEntries?: Entries;
+	/** Entries to write encrypted. A `null` value deletes the key. */
+	secretEntries?: Entries;
 	secret?: string;
+	/** Also spend older boxes that this push fully replaces (default true). */
+	reclaim?: boolean;
 }
 
 export interface PushResult {
 	txId: string | null;
 	/** EIP-12 unsigned tx; useful for build-only signers. */
 	unsigned: unknown;
+	/** Number of new boxes created. */
+	boxes: number;
 }
 
 export class AuthSync {
@@ -33,25 +39,57 @@ export class AuthSync {
 		private explorer: string = DEFAULT_EXPLORER
 	) {}
 
-	/** Newest box of this address, decoded. `null` if the user never pushed. */
-	async pull(secret?: string, address?: string): Promise<SyncBundle | null> {
+	/** Merged view of every auth-sync box of the address. */
+	async pull(secret?: string, address?: string): Promise<Merged> {
 		const addr = address ?? (await this.signer.address());
-		const latest = await fetchLatestBox(addr, this.explorer);
-		return latest ? decodeRegisters(latest.registers, secret) : null;
+		return mergeBoxes(await fetchBoxes(addr, this.explorer), secret);
 	}
 
-	/** Replace the stored state with a new box (the old one is spent if unspent). */
+	/**
+	 * Write the given entries in new box(es). Other keys are untouched. If the
+	 * entries do not fit in one box they are split over several outputs of one tx.
+	 */
 	async push(p: PushParams): Promise<PushResult> {
 		const address = await this.signer.address();
-		const registers = await encodeRegisters(p);
-		const [inputs, height, latest] = await Promise.all([
+		const chunks = await splitEntries(p.publicEntries ?? {}, p.secretEntries ?? {});
+		if (chunks.length === 0) throw new Error('Nothing to push.');
+		const registers = await Promise.all(
+			chunks.map((c) => encodeRegisters({ ...c, secret: p.secret }))
+		);
+
+		const [inputs, height, existing] = await Promise.all([
 			this.signer.utxos(),
 			this.signer.height(),
-			fetchLatestBox(address, this.explorer)
+			fetchBoxes(address, this.explorer)
 		]);
-		const previous = latest?.unspent ? (latest.box as unknown as InputBox) : undefined;
-		const tx = buildSyncTx({ address, inputs, height, registers, previous });
+
+		let reclaim: InputBox[] = [];
+		if (p.reclaim !== false) {
+			// Pretend the new entries are already there, then see which old boxes die.
+			const fresh = { ...(p.publicEntries ?? {}), ...(p.secretEntries ?? {}) };
+			const merged = await mergeBoxes(existing, p.secret);
+			reclaim = await this.reclaimable(existing, merged, fresh, p.secret);
+		}
+		const tx = buildSyncTx({ address, inputs, height, registers, reclaim });
 		const unsigned = tx.toEIP12Object();
-		return { txId: await this.signer.signAndSubmit(unsigned), unsigned };
+		return { txId: await this.signer.signAndSubmit(unsigned), unsigned, boxes: registers.length };
+	}
+
+	/** Unspent boxes (already readable) whose keys are all shadowed by `fresh` or newer boxes. */
+	private async reclaimable(
+		existing: Awaited<ReturnType<typeof fetchBoxes>>,
+		merged: Merged,
+		fresh: Entries,
+		secret?: string
+	): Promise<InputBox[]> {
+		const out: InputBox[] = [];
+		for (const pb of existing) {
+			if (!pb.unspent || merged.lockedBoxes.includes(pb.box.boxId)) continue;
+			const c = await decodeRegisters(pb.registers, secret);
+			const keys = Object.keys({ ...c.publicEntries, ...(c.secretEntries ?? {}) });
+			const dead = keys.every((k) => k in fresh || merged.sources[k] !== pb.box.boxId);
+			if (dead) out.push(pb.box as unknown as InputBox);
+		}
+		return out;
 	}
 }

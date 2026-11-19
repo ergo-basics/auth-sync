@@ -2,8 +2,8 @@
 export * from './types';
 export * from './constants';
 export { DecryptError } from './crypto';
-export { encodeRegisters, decodeRegisters, hasValidHeader } from './codec';
+export { encodeRegisters, decodeRegisters, splitEntries, hasValidHeader } from './codec';
 export type { EncodeParams } from './codec';
-export { fetchLatestBox, pickLatest, readRegisters, isNewer, buildSyncTx } from './chain';
-export type { BuildSyncTxParams } from './chain';
+export { fetchBoxes, parseBoxes, mergeBoxes, readRegisters, isNewer, buildSyncTx } from './chain';
+export type { BuildSyncTxParams, Merged } from './chain';
 export { AuthSync } from './authSync';

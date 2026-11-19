@@ -1532,6 +1532,7 @@ function openEnvelope(envelope, secret, aad) {
 // src/lib/core/codec.ts
 var enc2 = new TextEncoder();
 var dec = new TextDecoder();
+var ENVELOPE_OVERHEAD = 2 + 16 + 24 + 16;
 async function pipe(data, stream) {
   const w = stream.writable.getWriter();
   w.write(data);
@@ -1543,49 +1544,77 @@ var inflate = (d) => pipe(d, new DecompressionStream("deflate-raw"));
 function hasValidHeader(r4) {
   return !!r4 && r4.length >= 4 && MAGIC.every((b, i) => r4[i] === b);
 }
-function checkRecords(records) {
-  const seen = /* @__PURE__ */ new Set();
-  for (const r of records) {
-    if (!r.id || typeof r.id !== "string") throw new Error("Every record needs a string id.");
-    if (seen.has(r.id)) throw new Error(`Duplicate record id "${r.id}".`);
-    seen.add(r.id);
+function checkEntries(pub, sec) {
+  for (const k of Object.keys(sec)) {
+    if (k in pub) throw new Error(`Key "${k}" is both public and secret.`);
   }
 }
 async function encodeRegisters(p) {
-  const pub = p.publicRecords ?? [];
-  const sec = p.secretRecords ?? [];
-  checkRecords([...pub, ...sec]);
+  const pub = p.publicEntries ?? {};
+  const sec = p.secretEntries ?? {};
+  checkEntries(pub, sec);
   const R4 = HEADER;
-  const R5 = enc2.encode(JSON.stringify({ records: pub }));
+  const R5 = enc2.encode(JSON.stringify(pub));
   let R6 = new Uint8Array(0);
-  if (sec.length > 0) {
-    if (!p.secret) throw new Error("A secret is required to encrypt records.");
-    const plain = await deflate(enc2.encode(JSON.stringify({ records: sec })));
+  if (Object.keys(sec).length > 0) {
+    if (!p.secret) throw new Error("A secret is required to encrypt entries.");
+    const plain = await deflate(enc2.encode(JSON.stringify(sec)));
     R6 = sealEnvelope(plain, p.secret, concat(R4, R5));
   }
   const total = R4.length + R5.length + R6.length;
   if (total > MAX_REGISTER_BYTES) {
-    throw new Error(
-      `Payload is ${total} bytes; the limit is ${MAX_REGISTER_BYTES} (an Ergo box holds at most 4 KB).`
-    );
+    throw new Error(`Payload is ${total} bytes; the limit per box is ${MAX_REGISTER_BYTES}.`);
   }
   return { R4, R5, R6 };
 }
 async function decodeRegisters(reg, secret) {
   if (!hasValidHeader(reg.R4)) throw new Error("Not an auth-sync box (bad magic).");
   if (reg.R4[3] !== FORMAT_VERSION) throw new Error(`Unsupported format version ${reg.R4[3]}.`);
-  const publicRecords = JSON.parse(dec.decode(reg.R5)).records ?? [];
+  const publicEntries = JSON.parse(dec.decode(reg.R5));
   const hasEncrypted = reg.R6.length > 0;
-  let secretRecords = hasEncrypted ? null : [];
+  let secretEntries = hasEncrypted ? null : {};
   if (hasEncrypted && secret) {
     const plain = await inflate(openEnvelope(reg.R6, secret, concat(reg.R4, reg.R5)));
-    secretRecords = JSON.parse(dec.decode(plain)).records ?? [];
+    secretEntries = JSON.parse(dec.decode(plain));
   }
-  return { publicRecords, secretRecords, hasEncrypted };
+  return { publicEntries, secretEntries, hasEncrypted };
+}
+async function estimate(pub, sec) {
+  let n = HEADER.length + enc2.encode(JSON.stringify(pub)).length;
+  if (Object.keys(sec).length > 0) {
+    n += ENVELOPE_OVERHEAD + (await deflate(enc2.encode(JSON.stringify(sec)))).length;
+  }
+  return n;
+}
+async function splitEntries(pub, sec) {
+  checkEntries(pub, sec);
+  const chunks = [];
+  let cur = { publicEntries: {}, secretEntries: {} };
+  const add = async (k, v, secret) => {
+    const tryChunk = {
+      publicEntries: secret ? cur.publicEntries : { ...cur.publicEntries, [k]: v },
+      secretEntries: secret ? { ...cur.secretEntries, [k]: v } : cur.secretEntries
+    };
+    if (await estimate(tryChunk.publicEntries, tryChunk.secretEntries) <= MAX_REGISTER_BYTES) {
+      cur = tryChunk;
+      return;
+    }
+    if (Object.keys(cur.publicEntries).length + Object.keys(cur.secretEntries).length === 0) {
+      throw new Error(`Entry "${k}" alone does not fit in one box (${MAX_REGISTER_BYTES} bytes).`);
+    }
+    chunks.push(cur);
+    cur = { publicEntries: {}, secretEntries: {} };
+    await add(k, v, secret);
+  };
+  for (const [k, v] of Object.entries(pub)) await add(k, v, false);
+  for (const [k, v] of Object.entries(sec)) await add(k, v, true);
+  if (Object.keys(cur.publicEntries).length + Object.keys(cur.secretEntries).length > 0) chunks.push(cur);
+  return chunks;
 }
 
 // src/lib/core/chain.ts
 import {
+  BOX_VALUE_PER_BYTE,
   OutputBuilder,
   RECOMMENDED_MIN_FEE_VALUE,
   SAFE_MIN_BOX_VALUE,
@@ -1613,6 +1642,28 @@ function readRegisters(box) {
   if (!R5) return null;
   return { R4, R5, R6: regBytes(box, "R6") ?? new Uint8Array(0) };
 }
+function parseBoxes(boxes) {
+  const out = [];
+  for (const box of boxes) {
+    const registers = readRegisters(box);
+    if (registers) out.push({ box, registers, unspent: !box.spentTransactionId });
+  }
+  return out;
+}
+async function fetchBoxes(address, explorer = DEFAULT_EXPLORER, opts = {}) {
+  const f = opts.fetchImpl ?? fetch;
+  const limit = 100;
+  const all = [];
+  for (let page = 0; page < (opts.maxPages ?? 50); page++) {
+    const url = `${explorer}/api/v1/boxes/byAddress/${address}?limit=${limit}&offset=${page * limit}`;
+    const res = await f(url);
+    if (!res.ok) throw new Error(`Explorer ${res.status} for ${url}`);
+    const { items = [], total = 0 } = await res.json();
+    all.push(...items);
+    if ((page + 1) * limit >= total || items.length === 0) break;
+  }
+  return parseBoxes(all);
+}
 function age(b) {
   return [b.settlementHeight ?? b.creationHeight, b.globalIndex ?? 0];
 }
@@ -1621,44 +1672,45 @@ function isNewer(a, b) {
   const [bh, bi] = age(b);
   return ah !== bh ? ah > bh : ai > bi;
 }
-function pickLatest(boxes) {
-  let best = null;
-  for (const box of boxes) {
-    const registers = readRegisters(box);
-    if (!registers) continue;
-    if (!best || isNewer(box, best.box)) best = { box, registers, unspent: !box.spentTransactionId };
+async function mergeBoxes(boxes, secret) {
+  const sorted = [...boxes].sort((a, b) => isNewer(a.box, b.box) ? 1 : -1);
+  const winner = {};
+  const keysOf = /* @__PURE__ */ new Map();
+  const lockedBoxes = [];
+  for (const pb of sorted) {
+    const c = await decodeRegisters(pb.registers, secret);
+    if (c.secretEntries === null) lockedBoxes.push(pb.box.boxId);
+    const e = { ...c.publicEntries, ...c.secretEntries ?? {} };
+    keysOf.set(pb.box.boxId, Object.keys(e));
+    for (const [k, v] of Object.entries(e)) winner[k] = { value: v, boxId: pb.box.boxId };
   }
-  return best;
-}
-async function fetchLatestBox(address, explorer = DEFAULT_EXPLORER, opts = {}) {
-  const f = opts.fetchImpl ?? fetch;
-  const limit = 100;
-  const maxPages = opts.maxPages ?? 50;
-  const all = [];
-  for (let page = 0; page < maxPages; page++) {
-    const url = `${explorer}/api/v1/boxes/byAddress/${address}?limit=${limit}&offset=${page * limit}&sortDirection=desc`;
-    const res = await f(url);
-    if (!res.ok) throw new Error(`Explorer ${res.status} for ${url}`);
-    const { items = [], total = 0 } = await res.json();
-    all.push(...items);
-    if ((page + 1) * limit >= total || items.length === 0) break;
+  const entries = {};
+  const sources = {};
+  for (const [k, w] of Object.entries(winner)) {
+    sources[k] = w.boxId;
+    if (w.value !== null) entries[k] = w.value;
   }
-  return pickLatest(all);
+  const reclaimable = sorted.filter(
+    (pb) => pb.unspent && !lockedBoxes.includes(pb.box.boxId) && keysOf.get(pb.box.boxId).every((k) => sources[k] !== pb.box.boxId)
+  );
+  return { entries, sources, lockedBoxes, reclaimable };
 }
 function buildSyncTx(p) {
-  const out = new OutputBuilder(SAFE_MIN_BOX_VALUE, p.address);
-  const regs = {
-    R4: SColl(SByte, p.registers.R4).toHex(),
-    R5: SColl(SByte, p.registers.R5).toHex()
-  };
-  if (p.registers.R6.length > 0) regs.R6 = SColl(SByte, p.registers.R6).toHex();
-  out.setAdditionalRegisters(regs);
-  const b = new TransactionBuilder(p.height).from(p.inputs);
-  if (p.previous) {
-    const prevId = p.previous.boxId;
-    b.configureSelector((s) => s.ensureInclusion(prevId));
-  }
-  return b.to(out).sendChangeTo(p.address).payFee(p.fee ?? RECOMMENDED_MIN_FEE_VALUE).build();
+  const outputs = p.registers.map((r) => {
+    const out = new OutputBuilder(SAFE_MIN_BOX_VALUE, p.address);
+    const regs = {
+      R4: SColl(SByte, r.R4).toHex(),
+      R5: SColl(SByte, r.R5).toHex()
+    };
+    if (r.R6.length > 0) regs.R6 = SColl(SByte, r.R6).toHex();
+    out.setAdditionalRegisters(regs).setCreationHeight(p.height);
+    const need = BigInt(out.estimateSize()) * BOX_VALUE_PER_BYTE;
+    return need > SAFE_MIN_BOX_VALUE ? out.setValue(need) : out;
+  });
+  const reclaim = p.reclaim ?? [];
+  const ids = new Set(reclaim.map((b) => b.boxId));
+  const rest = p.inputs.filter((b) => !ids.has(b.boxId));
+  return new TransactionBuilder(p.height).from([...reclaim, ...rest]).configureSelector((s) => s.ensureInclusion(reclaim.map((b) => b.boxId))).to(outputs).sendChangeTo(p.address).payFee(p.fee ?? RECOMMENDED_MIN_FEE_VALUE).build();
 }
 
 // src/lib/core/authSync.ts
@@ -1669,25 +1721,48 @@ var AuthSync = class {
   }
   signer;
   explorer;
-  /** Newest box of this address, decoded. `null` if the user never pushed. */
+  /** Merged view of every auth-sync box of the address. */
   async pull(secret, address) {
     const addr = address ?? await this.signer.address();
-    const latest = await fetchLatestBox(addr, this.explorer);
-    return latest ? decodeRegisters(latest.registers, secret) : null;
+    return mergeBoxes(await fetchBoxes(addr, this.explorer), secret);
   }
-  /** Replace the stored state with a new box (the old one is spent if unspent). */
+  /**
+   * Write the given entries in new box(es). Other keys are untouched. If the
+   * entries do not fit in one box they are split over several outputs of one tx.
+   */
   async push(p) {
     const address = await this.signer.address();
-    const registers = await encodeRegisters(p);
-    const [inputs, height, latest] = await Promise.all([
+    const chunks = await splitEntries(p.publicEntries ?? {}, p.secretEntries ?? {});
+    if (chunks.length === 0) throw new Error("Nothing to push.");
+    const registers = await Promise.all(
+      chunks.map((c) => encodeRegisters({ ...c, secret: p.secret }))
+    );
+    const [inputs, height, existing] = await Promise.all([
       this.signer.utxos(),
       this.signer.height(),
-      fetchLatestBox(address, this.explorer)
+      fetchBoxes(address, this.explorer)
     ]);
-    const previous = latest?.unspent ? latest.box : void 0;
-    const tx = buildSyncTx({ address, inputs, height, registers, previous });
+    let reclaim = [];
+    if (p.reclaim !== false) {
+      const fresh = { ...p.publicEntries ?? {}, ...p.secretEntries ?? {} };
+      const merged = await mergeBoxes(existing, p.secret);
+      reclaim = await this.reclaimable(existing, merged, fresh, p.secret);
+    }
+    const tx = buildSyncTx({ address, inputs, height, registers, reclaim });
     const unsigned = tx.toEIP12Object();
-    return { txId: await this.signer.signAndSubmit(unsigned), unsigned };
+    return { txId: await this.signer.signAndSubmit(unsigned), unsigned, boxes: registers.length };
+  }
+  /** Unspent boxes (already readable) whose keys are all shadowed by `fresh` or newer boxes. */
+  async reclaimable(existing, merged, fresh, secret) {
+    const out = [];
+    for (const pb of existing) {
+      if (!pb.unspent || merged.lockedBoxes.includes(pb.box.boxId)) continue;
+      const c = await decodeRegisters(pb.registers, secret);
+      const keys = Object.keys({ ...c.publicEntries, ...c.secretEntries ?? {} });
+      const dead = keys.every((k) => k in fresh || merged.sources[k] !== pb.box.boxId);
+      if (dead) out.push(pb.box);
+    }
+    return out;
   }
 };
 export {
@@ -1707,11 +1782,13 @@ export {
   buildSyncTx,
   decodeRegisters,
   encodeRegisters,
-  fetchLatestBox,
+  fetchBoxes,
   hasValidHeader,
   isNewer,
-  pickLatest,
-  readRegisters
+  mergeBoxes,
+  parseBoxes,
+  readRegisters,
+  splitEntries
 };
 /*! Bundled license information:
 

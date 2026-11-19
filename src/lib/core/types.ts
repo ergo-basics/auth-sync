@@ -1,24 +1,15 @@
 // SPDX-License-Identifier: MIT
 // Types shared by the auth-sync protocol.
 
-/** One logical item stored in the auth-sync box. */
-export interface SyncRecord {
-	/** Unique id inside the box (e.g. "chatui/settings", "wallet/ergo"). */
-	id: string;
-	/** Free-form category: "settings", "mnemonic", "app-config", "data"... */
-	kind: string;
-	/** JSON-serialisable value. */
-	data: unknown;
-	/** Unix ms, set by the writer. */
-	updatedAt: number;
-}
+/** Key → JSON value. `null` marks a key as deleted (it still shadows older boxes). */
+export type Entries = Record<string, unknown>;
 
-/** Plain content of a box after decoding. */
-export interface SyncBundle {
-	/** Records stored unencrypted in R5. */
-	publicRecords: SyncRecord[];
-	/** Records stored encrypted in R6. `null` if locked (no secret given). */
-	secretRecords: SyncRecord[] | null;
+/** Plain content of ONE box after decoding. */
+export interface BoxContent {
+	/** Entries stored unencrypted in R5. */
+	publicEntries: Entries;
+	/** Entries stored encrypted in R6. `null` if locked (no secret given). */
+	secretEntries: Entries | null;
 	/** True if the box carries an encrypted section. */
 	hasEncrypted: boolean;
 }
@@ -46,7 +37,8 @@ export interface ExplorerBoxLike {
 	additionalRegisters: Record<string, string | { serializedValue: string }>;
 }
 
-export interface LatestBox {
+/** An auth-sync box found on chain. */
+export interface ParsedBox {
 	box: ExplorerBoxLike;
 	registers: SyncRegisters;
 	/** True if the box is still unspent. */
