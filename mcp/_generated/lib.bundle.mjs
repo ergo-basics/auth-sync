@@ -5,7 +5,7 @@ var MAGIC = new Uint8Array([65, 83, 89]);
 var FORMAT_VERSION = 1;
 var HEADER = new Uint8Array([...MAGIC, FORMAT_VERSION]);
 var ENVELOPE_VERSION = 1;
-var MAX_REGISTER_BYTES = 3600;
+var MAX_REGISTER_BYTES = 3500;
 var SCRYPT_LOG_N = 15;
 var SCRYPT_R = 8;
 var SCRYPT_P = 1;
@@ -37,6 +37,9 @@ function abytes(value, length, title = "") {
   if (!bytes)
     throw new TypeError(message);
   throw new RangeError(message);
+}
+function copyBytes(bytes) {
+  return Uint8Array.from(abytes(bytes));
 }
 function ahash(h) {
   if (typeof h !== "function" || typeof h.create !== "function")
@@ -92,6 +95,7 @@ var isLE = /* @__PURE__ */ (() => new Uint8Array(new Uint32Array([287454020]).bu
 function byteSwap(word) {
   return word << 24 & 4278190080 | word << 8 & 16711680 | word >>> 8 & 65280 | word >>> 24 & 255;
 }
+var swap8IfBE = isLE ? (n) => n : (n) => byteSwap(n) >>> 0;
 function byteSwap32(arr) {
   for (let i = 0; i < arr.length; i++) {
     arr[i] = byteSwap(arr[i]);
@@ -99,6 +103,21 @@ function byteSwap32(arr) {
   return arr;
 }
 var swap32IfBE = isLE ? (u) => u : byteSwap32;
+var hasHexBuiltin = /* @__PURE__ */ (() => (
+  // @ts-ignore
+  typeof Uint8Array.from([]).toHex === "function" && typeof Uint8Array.fromHex === "function"
+))();
+var hexes = /* @__PURE__ */ Array.from({ length: 256 }, (_, i) => i.toString(16).padStart(2, "0"));
+function bytesToHex(bytes) {
+  abytes(bytes);
+  if (hasHexBuiltin)
+    return bytes.toHex();
+  let hex = "";
+  for (let i = 0; i < bytes.length; i++) {
+    hex += hexes[bytes[i]];
+  }
+  return hex;
+}
 function utf8ToBytes(str) {
   if (typeof str !== "string")
     throw new TypeError("string expected");
@@ -301,6 +320,18 @@ function setU64FromNum(view, byteOffset, n, isLE3) {
   view.setUint32(byteOffset, isLE3 ? l : h, isLE3);
   view.setUint32(byteOffset + 4, isLE3 ? h : l, isLE3);
 }
+var rotrSH = (h, l, s) => h >>> s | l << 32 - s;
+var rotrSL = (h, l, s) => h << 32 - s | l >>> s;
+var rotrBH = (h, l, s) => h << 64 - s | l >>> s - 32;
+var rotrBL = (h, l, s) => h >>> s - 32 | l << 64 - s;
+var rotr32H = (_h, l) => l;
+var rotr32L = (h, _l) => h;
+function add(Ah, Al, Bh, Bl) {
+  const l = (Al >>> 0) + (Bl >>> 0);
+  return { h: Ah + Bh + (l / 2 ** 32 | 0) | 0, l: l | 0 };
+}
+var add3L = (Al, Bl, Cl) => (Al >>> 0) + (Bl >>> 0) + (Cl >>> 0);
+var add3H = (low, Ah, Bh, Ch) => Ah + Bh + Ch + (low / 2 ** 32 | 0) | 0;
 
 // node_modules/@noble/hashes/_md.js
 function Chi(a, b, c) {
@@ -912,7 +943,7 @@ function u64Lengths(dataLength, aadLength, isLE3) {
 function isAligned32(bytes) {
   return bytes.byteOffset % 4 === 0;
 }
-function copyBytes(bytes) {
+function copyBytes2(bytes) {
   return Uint8Array.from(abytes2(bytes));
 }
 function randomBytes(bytesLength = 32) {
@@ -1006,7 +1037,7 @@ function createCipher(core, opts) {
     let k;
     let sigma;
     if (l === 32) {
-      toClean.push(k = copyBytes(key));
+      toClean.push(k = copyBytes2(key));
       sigma = sigma32_32;
     } else if (l === 16 && allowShortKeys) {
       k = new Uint8Array(32);
@@ -1019,7 +1050,7 @@ function createCipher(core, opts) {
       throw new Error("invalid key size");
     }
     if (!isLE2 || !isAligned32(nonce))
-      toClean.push(nonce = copyBytes(nonce));
+      toClean.push(nonce = copyBytes2(nonce));
     let k32 = u322(k);
     if (extendNonceFn) {
       if (nonce.length !== 24)
@@ -1072,7 +1103,7 @@ var Poly1305 = class {
   destroyed = false;
   // Can be speed-up using BigUint64Array, at the cost of complexity
   constructor(key) {
-    key = copyBytes(abytes2(key, 32, "key"));
+    key = copyBytes2(abytes2(key, 32, "key"));
     const t0 = u8to16(key, 0);
     const t1 = u8to16(key, 2);
     const t2 = u8to16(key, 4);
@@ -1253,7 +1284,7 @@ var Poly1305 = class {
   update(data) {
     aexists2(this);
     abytes2(data);
-    data = copyBytes(data);
+    data = copyBytes2(data);
     const { buffer, blockLen } = this;
     const len = data.length;
     for (let pos = 0; pos < len; ) {
@@ -1590,7 +1621,7 @@ async function splitEntries(pub, sec) {
   checkEntries(pub, sec);
   const chunks = [];
   let cur = { publicEntries: {}, secretEntries: {} };
-  const add = async (k, v, secret) => {
+  const add2 = async (k, v, secret) => {
     const tryChunk = {
       publicEntries: secret ? cur.publicEntries : { ...cur.publicEntries, [k]: v },
       secretEntries: secret ? { ...cur.secretEntries, [k]: v } : cur.secretEntries
@@ -1604,10 +1635,10 @@ async function splitEntries(pub, sec) {
     }
     chunks.push(cur);
     cur = { publicEntries: {}, secretEntries: {} };
-    await add(k, v, secret);
+    await add2(k, v, secret);
   };
-  for (const [k, v] of Object.entries(pub)) await add(k, v, false);
-  for (const [k, v] of Object.entries(sec)) await add(k, v, true);
+  for (const [k, v] of Object.entries(pub)) await add2(k, v, false);
+  for (const [k, v] of Object.entries(sec)) await add2(k, v, true);
   if (Object.keys(cur.publicEntries).length + Object.keys(cur.secretEntries).length > 0) chunks.push(cur);
   return chunks;
 }
@@ -1621,6 +1652,621 @@ import {
   TransactionBuilder
 } from "@fleet-sdk/core";
 import { SByte, SColl, SConstant } from "@fleet-sdk/serializer";
+
+// node_modules/@noble/hashes/_blake.js
+var BSIGMA = /* @__PURE__ */ Uint8Array.from([
+  0,
+  1,
+  2,
+  3,
+  4,
+  5,
+  6,
+  7,
+  8,
+  9,
+  10,
+  11,
+  12,
+  13,
+  14,
+  15,
+  14,
+  10,
+  4,
+  8,
+  9,
+  15,
+  13,
+  6,
+  1,
+  12,
+  0,
+  2,
+  11,
+  7,
+  5,
+  3,
+  11,
+  8,
+  12,
+  0,
+  5,
+  2,
+  15,
+  13,
+  10,
+  14,
+  3,
+  6,
+  7,
+  1,
+  9,
+  4,
+  7,
+  9,
+  3,
+  1,
+  13,
+  12,
+  11,
+  14,
+  2,
+  6,
+  5,
+  10,
+  4,
+  0,
+  15,
+  8,
+  9,
+  0,
+  5,
+  7,
+  2,
+  4,
+  10,
+  15,
+  14,
+  1,
+  11,
+  12,
+  6,
+  8,
+  3,
+  13,
+  2,
+  12,
+  6,
+  10,
+  0,
+  11,
+  8,
+  3,
+  4,
+  13,
+  7,
+  5,
+  15,
+  14,
+  1,
+  9,
+  12,
+  5,
+  1,
+  15,
+  14,
+  13,
+  4,
+  10,
+  0,
+  7,
+  6,
+  3,
+  9,
+  2,
+  8,
+  11,
+  13,
+  11,
+  7,
+  14,
+  12,
+  1,
+  3,
+  9,
+  5,
+  0,
+  15,
+  4,
+  8,
+  6,
+  2,
+  10,
+  6,
+  15,
+  14,
+  9,
+  11,
+  3,
+  0,
+  8,
+  12,
+  2,
+  13,
+  7,
+  1,
+  4,
+  10,
+  5,
+  10,
+  2,
+  8,
+  4,
+  7,
+  6,
+  1,
+  5,
+  15,
+  11,
+  9,
+  14,
+  3,
+  12,
+  13,
+  0,
+  0,
+  1,
+  2,
+  3,
+  4,
+  5,
+  6,
+  7,
+  8,
+  9,
+  10,
+  11,
+  12,
+  13,
+  14,
+  15,
+  14,
+  10,
+  4,
+  8,
+  9,
+  15,
+  13,
+  6,
+  1,
+  12,
+  0,
+  2,
+  11,
+  7,
+  5,
+  3,
+  // Blake1, unused in others
+  11,
+  8,
+  12,
+  0,
+  5,
+  2,
+  15,
+  13,
+  10,
+  14,
+  3,
+  6,
+  7,
+  1,
+  9,
+  4,
+  7,
+  9,
+  3,
+  1,
+  13,
+  12,
+  11,
+  14,
+  2,
+  6,
+  5,
+  10,
+  4,
+  0,
+  15,
+  8,
+  9,
+  0,
+  5,
+  7,
+  2,
+  4,
+  10,
+  15,
+  14,
+  1,
+  11,
+  12,
+  6,
+  8,
+  3,
+  13,
+  2,
+  12,
+  6,
+  10,
+  0,
+  11,
+  8,
+  3,
+  4,
+  13,
+  7,
+  5,
+  15,
+  14,
+  1,
+  9
+]);
+
+// node_modules/@noble/hashes/blake2.js
+var B2B_IV = /* @__PURE__ */ Uint32Array.from([
+  4089235720,
+  1779033703,
+  2227873595,
+  3144134277,
+  4271175723,
+  1013904242,
+  1595750129,
+  2773480762,
+  2917565137,
+  1359893119,
+  725511199,
+  2600822924,
+  4215389547,
+  528734635,
+  327033209,
+  1541459225
+]);
+var BBUF = /* @__PURE__ */ new Uint32Array(32);
+function G1b(a, b, c, d, msg, x) {
+  const Xl = msg[x], Xh = msg[x + 1];
+  let Al = BBUF[2 * a], Ah = BBUF[2 * a + 1];
+  let Bl = BBUF[2 * b], Bh = BBUF[2 * b + 1];
+  let Cl = BBUF[2 * c], Ch = BBUF[2 * c + 1];
+  let Dl = BBUF[2 * d], Dh = BBUF[2 * d + 1];
+  const ll = add3L(Al, Bl, Xl);
+  Ah = add3H(ll, Ah, Bh, Xh);
+  Al = ll | 0;
+  let xh = Dh ^ Ah, xl = Dl ^ Al;
+  Dh = rotr32H(xh, xl);
+  Dl = rotr32L(xh, xl);
+  ({ h: Ch, l: Cl } = add(Ch, Cl, Dh, Dl));
+  xh = Bh ^ Ch;
+  xl = Bl ^ Cl;
+  Bh = rotrSH(xh, xl, 24);
+  Bl = rotrSL(xh, xl, 24);
+  BBUF[2 * a] = Al;
+  BBUF[2 * a + 1] = Ah;
+  BBUF[2 * b] = Bl;
+  BBUF[2 * b + 1] = Bh;
+  BBUF[2 * c] = Cl;
+  BBUF[2 * c + 1] = Ch;
+  BBUF[2 * d] = Dl;
+  BBUF[2 * d + 1] = Dh;
+}
+function G2b(a, b, c, d, msg, x) {
+  const Xl = msg[x], Xh = msg[x + 1];
+  let Al = BBUF[2 * a], Ah = BBUF[2 * a + 1];
+  let Bl = BBUF[2 * b], Bh = BBUF[2 * b + 1];
+  let Cl = BBUF[2 * c], Ch = BBUF[2 * c + 1];
+  let Dl = BBUF[2 * d], Dh = BBUF[2 * d + 1];
+  const ll = add3L(Al, Bl, Xl);
+  Ah = add3H(ll, Ah, Bh, Xh);
+  Al = ll | 0;
+  let xh = Dh ^ Ah, xl = Dl ^ Al;
+  Dh = rotrSH(xh, xl, 16);
+  Dl = rotrSL(xh, xl, 16);
+  ({ h: Ch, l: Cl } = add(Ch, Cl, Dh, Dl));
+  xh = Bh ^ Ch;
+  xl = Bl ^ Cl;
+  Bh = rotrBH(xh, xl, 63);
+  Bl = rotrBL(xh, xl, 63);
+  BBUF[2 * a] = Al;
+  BBUF[2 * a + 1] = Ah;
+  BBUF[2 * b] = Bl;
+  BBUF[2 * b + 1] = Bh;
+  BBUF[2 * c] = Cl;
+  BBUF[2 * c + 1] = Ch;
+  BBUF[2 * d] = Dl;
+  BBUF[2 * d + 1] = Dh;
+}
+function checkBlake2Opts(outputLen, opts = {}, keyLen, saltLen, persLen) {
+  anumber(keyLen);
+  if (outputLen <= 0 || outputLen > keyLen)
+    throw new Error('"dkLen" must be 1..' + keyLen + ", got " + outputLen);
+  const { key, salt, personalization } = opts;
+  if (key !== void 0 && (key.length < 1 || key.length > keyLen))
+    throw new Error('"key" expected to be undefined or of length=1..' + keyLen);
+  if (salt !== void 0)
+    abytes(salt, saltLen, "salt");
+  if (personalization !== void 0)
+    abytes(personalization, persLen, "personalization");
+}
+var _BLAKE2 = class {
+  buffer;
+  buffer32;
+  finished = false;
+  destroyed = false;
+  length = 0;
+  pos = 0;
+  blockLen;
+  outputLen;
+  canXOF = false;
+  constructor(blockLen, outputLen) {
+    anumber(blockLen);
+    anumber(outputLen);
+    this.blockLen = blockLen;
+    this.outputLen = outputLen;
+    this.buffer = new Uint8Array(blockLen);
+    this.buffer32 = u32(this.buffer);
+  }
+  update(data) {
+    aexists(this);
+    abytes(data);
+    const { blockLen, buffer, buffer32 } = this;
+    const len = data.length;
+    const offset = data.byteOffset;
+    const buf = data.buffer;
+    for (let pos = 0; pos < len; ) {
+      if (this.pos === blockLen) {
+        swap32IfBE(buffer32);
+        this.compress(buffer32, 0, false);
+        swap32IfBE(buffer32);
+        this.pos = 0;
+      }
+      const take = Math.min(blockLen - this.pos, len - pos);
+      const dataOffset = offset + pos;
+      if (take === blockLen && !(dataOffset % 4) && pos + take < len) {
+        const data32 = new Uint32Array(buf, dataOffset, Math.floor((len - pos) / 4));
+        swap32IfBE(data32);
+        for (let pos32 = 0; pos + blockLen < len; pos32 += buffer32.length, pos += blockLen) {
+          this.length += blockLen;
+          this.compress(data32, pos32, false);
+        }
+        swap32IfBE(data32);
+        continue;
+      }
+      buffer.set(pos === 0 && take === len ? data : data.subarray(pos, pos + take), this.pos);
+      this.pos += take;
+      this.length += take;
+      pos += take;
+    }
+    return this;
+  }
+  digestInto(out) {
+    aexists(this);
+    aoutput(out, this);
+    if (out.byteOffset & 3)
+      throw new RangeError('"output" expected 4-byte aligned byteOffset, got ' + out.byteOffset);
+    const { pos, buffer32 } = this;
+    this.finished = true;
+    this.buffer.fill(0, pos);
+    swap32IfBE(buffer32);
+    this.compress(buffer32, 0, true);
+    swap32IfBE(buffer32);
+    const state = this.get();
+    const out32 = out === this.buffer ? buffer32 : u32(out);
+    const full = Math.floor(this.outputLen / 4);
+    for (let i = 0; i < full; i++)
+      out32[i] = swap8IfBE(state[i]);
+    const tail = this.outputLen % 4;
+    if (!tail)
+      return;
+    const off = full * 4;
+    const word = state[full];
+    for (let i = 0; i < tail; i++)
+      out[off + i] = word >>> 8 * i;
+  }
+  digest() {
+    const { buffer, outputLen } = this;
+    this.digestInto(buffer);
+    const res = buffer.slice(0, outputLen);
+    this.destroy();
+    return res;
+  }
+  _cloneInto(to) {
+    const { buffer, length, finished, destroyed, outputLen, pos } = this;
+    to ||= new this.constructor({ dkLen: outputLen });
+    to.set(...this.get());
+    to.buffer.set(buffer);
+    to.destroyed = destroyed;
+    to.finished = finished;
+    to.length = length;
+    to.pos = pos;
+    to.outputLen = outputLen;
+    return to;
+  }
+  clone() {
+    return this._cloneInto();
+  }
+};
+var _BLAKE2b = class extends _BLAKE2 {
+  // Same IV words as SHA-512 / BLAKE2b, encoded as LE u32 low/high halves.
+  v0l = B2B_IV[0] | 0;
+  v0h = B2B_IV[1] | 0;
+  v1l = B2B_IV[2] | 0;
+  v1h = B2B_IV[3] | 0;
+  v2l = B2B_IV[4] | 0;
+  v2h = B2B_IV[5] | 0;
+  v3l = B2B_IV[6] | 0;
+  v3h = B2B_IV[7] | 0;
+  v4l = B2B_IV[8] | 0;
+  v4h = B2B_IV[9] | 0;
+  v5l = B2B_IV[10] | 0;
+  v5h = B2B_IV[11] | 0;
+  v6l = B2B_IV[12] | 0;
+  v6h = B2B_IV[13] | 0;
+  v7l = B2B_IV[14] | 0;
+  v7h = B2B_IV[15] | 0;
+  constructor(opts = {}) {
+    opts = checkOpts({}, opts);
+    const olen = opts.dkLen === void 0 ? 64 : opts.dkLen;
+    super(128, olen);
+    checkBlake2Opts(olen, opts, 64, 16, 16);
+    let { key, personalization, salt } = opts;
+    let keyLength = 0;
+    if (key !== void 0) {
+      abytes(key, void 0, "key");
+      keyLength = key.length;
+    }
+    this.v0l ^= this.outputLen | keyLength << 8 | 1 << 16 | 1 << 24;
+    if (salt !== void 0) {
+      abytes(salt, void 0, "salt");
+      const slt = u32(copyBytes(salt));
+      this.v4l ^= swap8IfBE(slt[0]);
+      this.v4h ^= swap8IfBE(slt[1]);
+      this.v5l ^= swap8IfBE(slt[2]);
+      this.v5h ^= swap8IfBE(slt[3]);
+    }
+    if (personalization !== void 0) {
+      abytes(personalization, void 0, "personalization");
+      const pers = u32(copyBytes(personalization));
+      this.v6l ^= swap8IfBE(pers[0]);
+      this.v6h ^= swap8IfBE(pers[1]);
+      this.v7l ^= swap8IfBE(pers[2]);
+      this.v7h ^= swap8IfBE(pers[3]);
+    }
+    if (key !== void 0) {
+      const tmp = new Uint8Array(this.blockLen);
+      tmp.set(key);
+      this.update(tmp);
+      clean(tmp);
+    }
+  }
+  // prettier-ignore
+  get() {
+    let { v0l, v0h, v1l, v1h, v2l, v2h, v3l, v3h, v4l, v4h, v5l, v5h, v6l, v6h, v7l, v7h } = this;
+    return [v0l, v0h, v1l, v1h, v2l, v2h, v3l, v3h, v4l, v4h, v5l, v5h, v6l, v6h, v7l, v7h];
+  }
+  // prettier-ignore
+  set(v0l, v0h, v1l, v1h, v2l, v2h, v3l, v3h, v4l, v4h, v5l, v5h, v6l, v6h, v7l, v7h) {
+    this.v0l = v0l | 0;
+    this.v0h = v0h | 0;
+    this.v1l = v1l | 0;
+    this.v1h = v1h | 0;
+    this.v2l = v2l | 0;
+    this.v2h = v2h | 0;
+    this.v3l = v3l | 0;
+    this.v3h = v3h | 0;
+    this.v4l = v4l | 0;
+    this.v4h = v4h | 0;
+    this.v5l = v5l | 0;
+    this.v5h = v5h | 0;
+    this.v6l = v6l | 0;
+    this.v6h = v6h | 0;
+    this.v7l = v7l | 0;
+    this.v7h = v7h | 0;
+  }
+  compress(msg, offset, isLast) {
+    const { v0l, v0h, v1l, v1h, v2l, v2h, v3l, v3h, v4l, v4h, v5l, v5h, v6l, v6h, v7l, v7h } = this;
+    {
+      BBUF[0] = v0l;
+      BBUF[1] = v0h;
+      BBUF[2] = v1l;
+      BBUF[3] = v1h;
+      BBUF[4] = v2l;
+      BBUF[5] = v2h;
+      BBUF[6] = v3l;
+      BBUF[7] = v3h;
+      BBUF[8] = v4l;
+      BBUF[9] = v4h;
+      BBUF[10] = v5l;
+      BBUF[11] = v5h;
+      BBUF[12] = v6l;
+      BBUF[13] = v6h;
+      BBUF[14] = v7l;
+      BBUF[15] = v7h;
+    }
+    BBUF.set(B2B_IV, 16);
+    const l = fromNumL(this.length);
+    const h = fromNumH(this.length);
+    BBUF[24] = B2B_IV[8] ^ l;
+    BBUF[25] = B2B_IV[9] ^ h;
+    if (isLast) {
+      BBUF[28] = ~BBUF[28];
+      BBUF[29] = ~BBUF[29];
+    }
+    let j = 0;
+    const s = BSIGMA;
+    for (let i = 0; i < 12; i++) {
+      G1b(0, 4, 8, 12, msg, offset + 2 * s[j++]);
+      G2b(0, 4, 8, 12, msg, offset + 2 * s[j++]);
+      G1b(1, 5, 9, 13, msg, offset + 2 * s[j++]);
+      G2b(1, 5, 9, 13, msg, offset + 2 * s[j++]);
+      G1b(2, 6, 10, 14, msg, offset + 2 * s[j++]);
+      G2b(2, 6, 10, 14, msg, offset + 2 * s[j++]);
+      G1b(3, 7, 11, 15, msg, offset + 2 * s[j++]);
+      G2b(3, 7, 11, 15, msg, offset + 2 * s[j++]);
+      G1b(0, 5, 10, 15, msg, offset + 2 * s[j++]);
+      G2b(0, 5, 10, 15, msg, offset + 2 * s[j++]);
+      G1b(1, 6, 11, 12, msg, offset + 2 * s[j++]);
+      G2b(1, 6, 11, 12, msg, offset + 2 * s[j++]);
+      G1b(2, 7, 8, 13, msg, offset + 2 * s[j++]);
+      G2b(2, 7, 8, 13, msg, offset + 2 * s[j++]);
+      G1b(3, 4, 9, 14, msg, offset + 2 * s[j++]);
+      G2b(3, 4, 9, 14, msg, offset + 2 * s[j++]);
+    }
+    this.v0l ^= BBUF[0] ^ BBUF[16];
+    this.v0h ^= BBUF[1] ^ BBUF[17];
+    this.v1l ^= BBUF[2] ^ BBUF[18];
+    this.v1h ^= BBUF[3] ^ BBUF[19];
+    this.v2l ^= BBUF[4] ^ BBUF[20];
+    this.v2h ^= BBUF[5] ^ BBUF[21];
+    this.v3l ^= BBUF[6] ^ BBUF[22];
+    this.v3h ^= BBUF[7] ^ BBUF[23];
+    this.v4l ^= BBUF[8] ^ BBUF[24];
+    this.v4h ^= BBUF[9] ^ BBUF[25];
+    this.v5l ^= BBUF[10] ^ BBUF[26];
+    this.v5h ^= BBUF[11] ^ BBUF[27];
+    this.v6l ^= BBUF[12] ^ BBUF[28];
+    this.v6h ^= BBUF[13] ^ BBUF[29];
+    this.v7l ^= BBUF[14] ^ BBUF[30];
+    this.v7h ^= BBUF[15] ^ BBUF[31];
+    clean(BBUF);
+  }
+  destroy() {
+    this.destroyed = true;
+    clean(this.buffer32);
+    this.set(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+  }
+};
+var blake2b = /* @__PURE__ */ createHasher((opts) => new _BLAKE2b(opts));
+
+// src/lib/core/sign.ts
+var enc3 = new TextEncoder();
+var u323 = (n) => new Uint8Array([n >>> 24 & 255, n >>> 16 & 255, n >>> 8 & 255, n & 255]);
+var field = (b) => concat(u323(b.length), b);
+function signingMessage(r, creationHeight, address) {
+  const body = concat(
+    enc3.encode("auth-sync/v1"),
+    new Uint8Array([0]),
+    field(r.R4),
+    field(r.R5),
+    field(r.R6),
+    u323(creationHeight),
+    enc3.encode(address)
+  );
+  return "auth-sync:v1:" + bytesToHex(blake2b(body, { dkLen: 32 }));
+}
+var messageBytes = (m) => enc3.encode(m);
+
+// src/lib/core/chain.ts
 function regHex(box, key) {
   const v = box.additionalRegisters?.[key];
   return typeof v === "string" ? v : v?.serializedValue;
@@ -1639,18 +2285,27 @@ function readRegisters(box) {
   const R4 = regBytes(box, "R4");
   if (!hasValidHeader(R4)) return null;
   const R5 = regBytes(box, "R5");
-  if (!R5) return null;
-  return { R4, R5, R6: regBytes(box, "R6") ?? new Uint8Array(0) };
+  const R7 = regBytes(box, "R7");
+  if (!R5 || !R7) return null;
+  return { R4, R5, R6: regBytes(box, "R6") ?? new Uint8Array(0), R7 };
 }
-function parseBoxes(boxes) {
+async function parseBoxes(boxes, address, verify) {
   const out = [];
   for (const box of boxes) {
     const registers = readRegisters(box);
-    if (registers) out.push({ box, registers, unspent: !box.spentTransactionId });
+    if (!registers) continue;
+    const msg = messageBytes(signingMessage(registers, box.creationHeight, address));
+    let ok = false;
+    try {
+      ok = await verify(address, msg, registers.R7);
+    } catch {
+      ok = false;
+    }
+    if (ok) out.push({ box, registers, unspent: !box.spentTransactionId });
   }
   return out;
 }
-async function fetchBoxes(address, explorer = DEFAULT_EXPLORER, opts = {}) {
+async function fetchBoxes(address, verify, explorer = DEFAULT_EXPLORER, opts = {}) {
   const f = opts.fetchImpl ?? fetch;
   const limit = 100;
   const all = [];
@@ -1662,10 +2317,10 @@ async function fetchBoxes(address, explorer = DEFAULT_EXPLORER, opts = {}) {
     all.push(...items);
     if ((page + 1) * limit >= total || items.length === 0) break;
   }
-  return parseBoxes(all);
+  return parseBoxes(all, address, verify);
 }
 function age(b) {
-  return [b.settlementHeight ?? b.creationHeight, b.globalIndex ?? 0];
+  return [b.creationHeight, b.globalIndex ?? 0];
 }
 function isNewer(a, b) {
   const [ah, ai] = age(a);
@@ -1702,7 +2357,8 @@ function buildSyncTx(p) {
       R4: SColl(SByte, r.R4).toHex(),
       R5: SColl(SByte, r.R5).toHex()
     };
-    if (r.R6.length > 0) regs.R6 = SColl(SByte, r.R6).toHex();
+    regs.R6 = SColl(SByte, r.R6).toHex();
+    regs.R7 = SColl(SByte, r.R7).toHex();
     out.setAdditionalRegisters(regs).setCreationHeight(p.height);
     const need = BigInt(out.estimateSize()) * BOX_VALUE_PER_BYTE;
     return need > SAFE_MIN_BOX_VALUE ? out.setValue(need) : out;
@@ -1715,56 +2371,82 @@ function buildSyncTx(p) {
 
 // src/lib/core/authSync.ts
 var AuthSync = class {
-  constructor(signer, explorer = DEFAULT_EXPLORER) {
+  constructor(signer, verify, explorer = DEFAULT_EXPLORER) {
     this.signer = signer;
+    this.verify = verify;
     this.explorer = explorer;
   }
   signer;
+  verify;
   explorer;
-  /** Merged view of every auth-sync box of the address. */
+  /** Merged view of every valid auth-sync box of the address. */
   async pull(secret, address) {
     const addr = address ?? await this.signer.address();
-    return mergeBoxes(await fetchBoxes(addr, this.explorer), secret);
+    return mergeBoxes(await fetchBoxes(addr, this.verify, this.explorer), secret);
   }
   /**
    * Write the given entries in new box(es). Other keys are untouched. If the
    * entries do not fit in one box they are split over several outputs of one tx.
+   * Each new box needs one signature from the wallet, plus the tx signature.
    */
   async push(p) {
     const address = await this.signer.address();
     const chunks = await splitEntries(p.publicEntries ?? {}, p.secretEntries ?? {});
     if (chunks.length === 0) throw new Error("Nothing to push.");
-    const registers = await Promise.all(
-      chunks.map((c) => encodeRegisters({ ...c, secret: p.secret }))
-    );
+    const content = await Promise.all(chunks.map((c) => encodeRegisters({ ...c, secret: p.secret })));
     const [inputs, height, existing] = await Promise.all([
       this.signer.utxos(),
       this.signer.height(),
-      fetchBoxes(address, this.explorer)
+      fetchBoxes(address, this.verify, this.explorer)
     ]);
+    const registers = [];
+    for (const r of content) {
+      const R7 = await this.signer.signMessage(address, signingMessage(r, height, address));
+      registers.push({ ...r, R7 });
+    }
     let reclaim = [];
     if (p.reclaim !== false) {
       const fresh = { ...p.publicEntries ?? {}, ...p.secretEntries ?? {} };
-      const merged = await mergeBoxes(existing, p.secret);
-      reclaim = await this.reclaimable(existing, merged, fresh, p.secret);
+      reclaim = await this.reclaimable(existing, fresh, p.secret);
     }
     const tx = buildSyncTx({ address, inputs, height, registers, reclaim });
     const unsigned = tx.toEIP12Object();
     return { txId: await this.signer.signAndSubmit(unsigned), unsigned, boxes: registers.length };
   }
-  /** Unspent boxes (already readable) whose keys are all shadowed by `fresh` or newer boxes. */
-  async reclaimable(existing, merged, fresh, secret) {
+  /** Unspent readable boxes whose keys are all replaced by `fresh` or by newer boxes. */
+  async reclaimable(existing, fresh, secret) {
+    const merged = await mergeBoxes(existing, secret);
     const out = [];
     for (const pb of existing) {
       if (!pb.unspent || merged.lockedBoxes.includes(pb.box.boxId)) continue;
       const c = await decodeRegisters(pb.registers, secret);
       const keys = Object.keys({ ...c.publicEntries, ...c.secretEntries ?? {} });
-      const dead = keys.every((k) => k in fresh || merged.sources[k] !== pb.box.boxId);
-      if (dead) out.push(pb.box);
+      if (keys.every((k) => k in fresh || merged.sources[k] !== pb.box.boxId)) {
+        out.push(pb.box);
+      }
     }
     return out;
   }
 };
+
+// src/lib/core/verify-node.ts
+import * as wasm from "ergo-lib-wasm-nodejs";
+var nodeVerifier = (address, message, signature) => wasm.verify_signature(wasm.Address.from_base58(address), message, signature);
+function mnemonicMessageSigner(mnemonic, pass = "") {
+  const wallet = wasm.Wallet.from_mnemonic(mnemonic, pass);
+  return (address, message) => wallet.sign_message_using_p2pk(wasm.Address.from_base58(address), new TextEncoder().encode(message));
+}
+function secretMessageSigner(secret) {
+  const sk = wasm.SecretKey.dlog_from_bytes(secret);
+  const keys = new wasm.SecretKeys();
+  keys.add(sk);
+  const wallet = wasm.Wallet.from_secrets(keys);
+  const address = sk.get_address().to_base58(wasm.NetworkPrefix.Mainnet);
+  return {
+    address,
+    sign: (addr, message) => wallet.sign_message_using_p2pk(wasm.Address.from_base58(addr), new TextEncoder().encode(message))
+  };
+}
 export {
   AuthSync,
   DEFAULT_EXPLORER,
@@ -1786,8 +2468,13 @@ export {
   hasValidHeader,
   isNewer,
   mergeBoxes,
+  messageBytes,
+  mnemonicMessageSigner,
+  nodeVerifier,
   parseBoxes,
   readRegisters,
+  secretMessageSigner,
+  signingMessage,
   splitEntries
 };
 /*! Bundled license information:

@@ -34,6 +34,7 @@
 		"tslib": "^2.4.1",
 		"typescript": "^5.0.0",
 		"vite": "^4.5.2",
+		"vite-plugin-wasm": "^3.6.0",
 		"vitest": "^3.2.4",
 		"zod": "^3.25.76"
 	},
@@ -48,6 +49,8 @@
 		"@scure/base": "^1.1.3",
 		"@sveltejs/adapter-static": "^2.0.3",
 		"date-fns": "^4.1.0",
+		"ergo-lib-wasm-browser": "^0.28.0",
+		"ergo-lib-wasm-nodejs": "^0.28.0",
 		"esbuild": "^0.28.2",
 		"mode-watcher": "^0.5.0",
 		"update": "^0.7.4",

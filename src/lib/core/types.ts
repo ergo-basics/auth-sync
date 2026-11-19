@@ -14,12 +14,20 @@ export interface BoxContent {
 	hasEncrypted: boolean;
 }
 
-/** Raw register contents as bytes. */
-export interface SyncRegisters {
+/** Content registers of a box, before signing. */
+export interface ContentRegisters {
 	R4: Uint8Array; // header: magic + version
-	R5: Uint8Array; // public records (UTF-8 JSON)
+	R5: Uint8Array; // public entries (UTF-8 JSON object)
 	R6: Uint8Array; // encrypted envelope (may be empty)
 }
+
+/** Content registers plus the owner's signature. */
+export interface SyncRegisters extends ContentRegisters {
+	R7: Uint8Array; // Schnorr signature (56 bytes) by the owner
+}
+
+/** Checks that `signature` signs `message` for the P2PK `address`. */
+export type Verifier = (address: string, message: Uint8Array, signature: Uint8Array) => boolean | Promise<boolean>;
 
 /** Subset of the Explorer box we rely on. */
 export interface ExplorerBoxLike {

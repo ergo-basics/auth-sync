@@ -11,9 +11,9 @@ export const ENVELOPE_VERSION = 1;
 /**
  * Ergo limits a box to 4096 bytes in total. The ergoTree (P2PK ≈ 36 B), the
  * value, the creation height and the box overhead use some of it. We keep the
- * registers under this budget so the tx is always valid.
+ * registers (R4-R6, plus the 58 bytes of R7) under this budget so the tx is always valid.
  */
-export const MAX_REGISTER_BYTES = 3600;
+export const MAX_REGISTER_BYTES = 3500;
 
 /** scrypt cost (log2 N). 2^15 is ~100 ms on desktop and ~32 MiB of RAM. */
 export const SCRYPT_LOG_N = 15;

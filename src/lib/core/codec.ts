@@ -4,10 +4,11 @@
 //   R4  Coll[Byte]  header "ASY"+version
 //   R5  Coll[Byte]  UTF-8 JSON object {key: value}                 (unencrypted)
 //   R6  Coll[Byte]  envelope (see crypto.ts) of deflate(JSON object)  (optional)
+//   R7  Coll[Byte]  owner signature over R4..R6 + creationHeight + address (see sign.ts)
 
 import { FORMAT_VERSION, HEADER, MAGIC, MAX_REGISTER_BYTES } from './constants';
 import { concat, openEnvelope, sealEnvelope } from './crypto';
-import type { BoxContent, Entries, SyncRegisters } from './types';
+import type { BoxContent, ContentRegisters, Entries, SyncRegisters } from './types';
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -41,7 +42,7 @@ export interface EncodeParams {
 	secret?: string;
 }
 
-export async function encodeRegisters(p: EncodeParams): Promise<SyncRegisters> {
+export async function encodeRegisters(p: EncodeParams): Promise<ContentRegisters> {
 	const pub = p.publicEntries ?? {};
 	const sec = p.secretEntries ?? {};
 	checkEntries(pub, sec);
@@ -61,7 +62,7 @@ export async function encodeRegisters(p: EncodeParams): Promise<SyncRegisters> {
 	return { R4, R5, R6 };
 }
 
-export async function decodeRegisters(reg: SyncRegisters, secret?: string): Promise<BoxContent> {
+export async function decodeRegisters(reg: ContentRegisters, secret?: string): Promise<BoxContent> {
 	if (!hasValidHeader(reg.R4)) throw new Error('Not an auth-sync box (bad magic).');
 	if (reg.R4[3] !== FORMAT_VERSION) throw new Error(`Unsupported format version ${reg.R4[3]}.`);
 	const publicEntries: Entries = JSON.parse(dec.decode(reg.R5));

@@ -8,10 +8,11 @@
     import { WalletButton, walletConnected } from "wallet-svelte-component";
     import { AuthSync } from "$lib/core/authSync";
     import { browserSigner } from "$lib/ergo/browserSigner";
+    import { browserVerifier } from "$lib/ergo/browserVerifier";
     import { explorer_uri } from "$lib/ergo/envs";
     import type { Merged } from "$lib/core/chain";
 
-    const sync = new AuthSync(browserSigner, explorer_uri);
+    const sync = new AuthSync(browserSigner, browserVerifier, explorer_uri);
 
     let secret = "";
     let key = "";

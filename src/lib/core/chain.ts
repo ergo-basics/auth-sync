@@ -12,7 +12,8 @@ import {
 import { SByte, SColl, SConstant } from '@fleet-sdk/serializer';
 import { DEFAULT_EXPLORER } from './constants';
 import { decodeRegisters, hasValidHeader } from './codec';
-import type { Entries, ExplorerBoxLike, InputBox, ParsedBox, SyncRegisters } from './types';
+import { messageBytes, signingMessage } from './sign';
+import type { Entries, ExplorerBoxLike, InputBox, ParsedBox, SyncRegisters, Verifier } from './types';
 
 // ---------- register helpers ----------
 
@@ -32,29 +33,48 @@ function regBytes(box: ExplorerBoxLike, key: string): Uint8Array | undefined {
 	}
 }
 
-/** Parse the auth-sync registers of a box, or `null` if it is not one. */
+/** Parse the auth-sync registers of a box (R4-R7), or `null` if it is not one. */
 export function readRegisters(box: ExplorerBoxLike): SyncRegisters | null {
 	const R4 = regBytes(box, 'R4');
 	if (!hasValidHeader(R4)) return null;
 	const R5 = regBytes(box, 'R5');
-	if (!R5) return null;
-	return { R4: R4!, R5, R6: regBytes(box, 'R6') ?? new Uint8Array(0) };
+	const R7 = regBytes(box, 'R7');
+	if (!R5 || !R7) return null;
+	return { R4: R4!, R5, R6: regBytes(box, 'R6') ?? new Uint8Array(0), R7 };
 }
 
 // ---------- reading ----------
 
-export function parseBoxes(boxes: ExplorerBoxLike[]): ParsedBox[] {
+/**
+ * Keep only boxes of this address that carry a valid owner signature.
+ * Anyone can send a box to any address, so an unsigned or badly signed box
+ * is ignored, exactly like a box of another application.
+ */
+export async function parseBoxes(
+	boxes: ExplorerBoxLike[],
+	address: string,
+	verify: Verifier
+): Promise<ParsedBox[]> {
 	const out: ParsedBox[] = [];
 	for (const box of boxes) {
 		const registers = readRegisters(box);
-		if (registers) out.push({ box, registers, unspent: !box.spentTransactionId });
+		if (!registers) continue;
+		const msg = messageBytes(signingMessage(registers, box.creationHeight, address));
+		let ok = false;
+		try {
+			ok = await verify(address, msg, registers.R7);
+		} catch {
+			ok = false;
+		}
+		if (ok) out.push({ box, registers, unspent: !box.spentTransactionId });
 	}
 	return out;
 }
 
-/** All auth-sync boxes of an address, spent or not. */
+/** All valid auth-sync boxes of an address, spent or not. */
 export async function fetchBoxes(
 	address: string,
+	verify: Verifier,
 	explorer: string = DEFAULT_EXPLORER,
 	opts: { maxPages?: number; fetchImpl?: typeof fetch } = {}
 ): Promise<ParsedBox[]> {
@@ -69,19 +89,20 @@ export async function fetchBoxes(
 		all.push(...items);
 		if ((page + 1) * limit >= total || items.length === 0) break;
 	}
-	return parseBoxes(all);
+	return parseBoxes(all, address, verify);
 }
 
 // ---------- the merge rule ----------
 //
-// Many boxes may exist. For each key, the value from the box at the HIGHEST
-// block wins. Boxes in the same block are equally valid; we order them by
-// globalIndex only so every reader gets the same answer.
+// Many boxes may exist. For each key, the value from the box with the HIGHEST
+// creationHeight wins. creationHeight is covered by the owner's signature, so
+// nobody else can choose it. Boxes with the same creationHeight are equally
+// valid; we order them by globalIndex only so every reader gets the same answer.
 
 function age(b: ExplorerBoxLike): [number, number] {
-	return [b.settlementHeight ?? b.creationHeight, b.globalIndex ?? 0];
+	return [b.creationHeight, b.globalIndex ?? 0];
 }
-/** True if `a` entered the chain after `b`. */
+/** True if `a` wins over `b`. */
 export function isNewer(a: ExplorerBoxLike, b: ExplorerBoxLike): boolean {
 	const [ah, ai] = age(a);
 	const [bh, bi] = age(b);
@@ -136,7 +157,7 @@ export interface BuildSyncTxParams {
 	/** Spendable boxes of that address (wallet UTXOs). */
 	inputs: InputBox[];
 	height: number;
-	/** One entry per output box. */
+	/** One entry per output box, already signed (R7). */
 	registers: SyncRegisters[];
 	/** Obsolete data boxes to spend so their ERG is reclaimed. */
 	reclaim?: InputBox[];
@@ -150,7 +171,9 @@ export function buildSyncTx(p: BuildSyncTxParams) {
 			R4: SColl(SByte, r.R4).toHex(),
 			R5: SColl(SByte, r.R5).toHex()
 		};
-		if (r.R6.length > 0) regs.R6 = SColl(SByte, r.R6).toHex();
+		// Registers must be dense: R7 needs R6, so an empty R6 is still written.
+		regs.R6 = SColl(SByte, r.R6).toHex();
+		regs.R7 = SColl(SByte, r.R7).toHex();
 		out.setAdditionalRegisters(regs).setCreationHeight(p.height);
 		// Big payloads need more than the safe minimum (360 nanoERG per byte).
 		const need = BigInt(out.estimateSize()) * BOX_VALUE_PER_BYTE;
