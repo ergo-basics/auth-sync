@@ -2,7 +2,7 @@
 
 Keep encrypted app settings, hot-wallet mnemonics and other data in **one Ergo box
 of your own address**. On a new device, connect the wallet, enter your secret, and
-pull everything back. See [`IDEA.md`](./IDEA.md) for the original idea.
+pull everything back. The format is specified in [`EIP.md`](./EIP.md); see [`IDEA.md`](./IDEA.md) for the original idea.
 
 ## Box format (v1)
 
